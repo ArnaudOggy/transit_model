@@ -17,15 +17,41 @@
 use super::{Code, CommentLink, ObjectProperty, Result, Stop, StopTime};
 use crate::collection::{Collection, CollectionWithId, Id, Idx};
 use crate::model::Collections;
+use crate::ntfs::{has_fares_v1, has_fares_v2};
 use crate::objects::*;
 use crate::NTFS_VERSION;
-use chrono::NaiveDateTime;
+use chrono::{Duration, NaiveDateTime};
 use csv;
-use failure::ResultExt;
+use failure::{format_err, ResultExt};
 use log::info;
+use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde;
 use std::collections::{BTreeMap, HashMap};
+use std::convert::TryFrom;
 use std::path;
+
+impl TryFrom<(&Ticket, &TicketPrice)> for PriceV1 {
+    type Error = failure::Error;
+    fn try_from((ticket, price): (&Ticket, &TicketPrice)) -> Result<Self> {
+        let cents_price = price.price * Decimal::from(100);
+        let cents_price = cents_price
+            .round_dp(0)
+            .to_u32()
+            .ok_or_else(|| format_err!("Cannot convert price into a u32"))?;
+        let comment = ticket.comment.as_ref().cloned().unwrap_or_else(String::new);
+        let price_v1 = Self {
+            id: ticket.id.clone(),
+            start_date: price.ticket_validity_start,
+            end_date: price.ticket_validity_end + Duration::days(1),
+            price: cents_price,
+            name: ticket.name.clone(),
+            ignored: String::new(),
+            comment,
+            currency_type: Some("centime".to_string()),
+        };
+        Ok(price_v1)
+    }
+}
 
 pub fn write_feed_infos(
     path: &path::Path,
@@ -115,16 +141,12 @@ pub fn write_vehicle_journeys_and_stop_times(
     Ok(())
 }
 
-pub fn write_fares_v1(
+fn write_fares_v1(
     base_path: &path::Path,
     prices_v1: &Collection<PriceV1>,
     od_fares_v1: &Collection<ODFareV1>,
     fares_v1: &Collection<FareV1>,
 ) -> Result<()> {
-    if prices_v1.is_empty() || od_fares_v1.is_empty() {
-        return Ok(());
-    }
-
     let file_prices = "prices.csv";
     let file_od_fares = "od_fares.csv";
     let file_fares = "fares.csv";
@@ -157,6 +179,17 @@ pub fn write_fares_v1(
             .serialize(od_fare_v1)
             .with_context(ctx_from_path!(path))?;
     }
+    if od_fares_v1.is_empty() {
+        od_fares_wtr.write_record(&[
+            "Origin ID",
+            "Origin name",
+            "Origin mode",
+            "Destination ID",
+            "Destination name",
+            "Destination mode",
+            "ticket_id",
+        ])?;
+    }
     od_fares_wtr.flush().with_context(ctx_from_path!(path))?;
 
     if fares_v1.is_empty() {
@@ -176,6 +209,179 @@ pub fn write_fares_v1(
     }
     fares_wtr.flush().with_context(ctx_from_path!(path))?;
 
+    Ok(())
+}
+
+fn write_fares_v1_from_v2(
+    base_path: &path::Path,
+    tickets: &CollectionWithId<Ticket>,
+    ticket_uses: &CollectionWithId<TicketUse>,
+    ticket_prices: &Collection<TicketPrice>,
+    ticket_use_perimeters: &Collection<TicketUsePerimeter>,
+    ticket_use_restrictions: &Collection<TicketUseRestriction>,
+) -> Result<()> {
+    fn has_constraints(ticket_use: &TicketUse) -> bool {
+        ticket_use.max_transfers.map(|mt| mt != 0).unwrap_or(false)
+            || ticket_use.boarding_time_limit.is_some()
+            || ticket_use.alighting_time_limit.is_some()
+    }
+    fn get_prices<'a>(
+        ticket_prices: &'a Collection<TicketPrice>,
+        ticket_id: &'a String,
+    ) -> Vec<&'a TicketPrice> {
+        ticket_prices
+            .into_iter()
+            .map(|(_, ticket_price)| ticket_price)
+            .filter(|ticket_price| &ticket_price.ticket_id == ticket_id)
+            .filter(|ticket_price| &ticket_price.currency == "EUR")
+            .collect()
+    }
+
+    let mut prices_v1: Vec<PriceV1> = vec![];
+    let mut fares_v1: Vec<FareV1> = vec![];
+
+    // Conversion of OD fares on specific lines
+
+    for ticket_use_restriction in ticket_use_restrictions
+        .values()
+        .filter(|ticket_use_restriction| {
+            ticket_use_restriction.restriction_type == RestrictionType::OriginDestination
+        })
+        .filter(|ticket_use_restriction| {
+            ticket_uses
+                .get(&ticket_use_restriction.ticket_use_id)
+                .map(|ticket_use| !has_constraints(ticket_use))
+                .unwrap_or(false)
+        })
+    {
+        let ticket_use_id = &ticket_use_restriction.ticket_use_id;
+        let ticket = match ticket_uses
+            .get(ticket_use_id)
+            .and_then(|ticket_use| tickets.get(&ticket_use.ticket_id))
+        {
+            Some(t) => t,
+            _ => {
+                info!("Failed to find Ticket for TicketUseId {:?}", ticket_use_id);
+                continue;
+            }
+        };
+
+        let perimeters: Vec<&TicketUsePerimeter> = ticket_use_perimeters
+            .into_iter()
+            .map(|(_, ticket_use_perimeter)| ticket_use_perimeter)
+            .filter(|ticket_use_perimeter| &ticket_use_perimeter.ticket_use_id == ticket_use_id)
+            .filter(|ticket_use_perimeter| ticket_use_perimeter.object_type == ObjectType::Line)
+            .filter(|ticket_use_perimeter| {
+                ticket_use_perimeter.perimeter_action == PerimeterAction::Included
+            })
+            .collect();
+
+        if perimeters.is_empty() {
+            info!(
+                "Failed to find TicketUsePerimeter for TicketUse {:?}",
+                ticket_use_id
+            );
+            continue;
+        }
+
+        let prices = get_prices(ticket_prices, &ticket.id);
+        if prices.is_empty() {
+            info!("Failed to find TicketPrice for Ticket {:?}", ticket.id);
+            continue;
+        }
+
+        for price in prices {
+            prices_v1.push(PriceV1::try_from((ticket, price))?);
+        }
+
+        for perimeter in perimeters {
+            fares_v1.push(FareV1 {
+                before_change: "*".to_string(),
+                after_change: format!("line=line:{}", perimeter.object_id),
+                start_trip: format!("stoparea=stop_area:{}", ticket_use_restriction.use_origin),
+                end_trip: format!(
+                    "stoparea=stop_area:{}",
+                    ticket_use_restriction.use_destination
+                ),
+                global_condition: String::new(),
+                ticket_id: ticket.id.clone(),
+            });
+        }
+    }
+
+    // Conversion of a flat fate on a specific network
+
+    for ticket_use_perimeter in ticket_use_perimeters
+        .values()
+        .filter(|p| p.object_type == ObjectType::Network)
+        .filter(|p| p.perimeter_action == PerimeterAction::Included)
+    {
+        let ticket_use_id = &ticket_use_perimeter.ticket_use_id;
+        let ticket = match ticket_uses
+            .get(ticket_use_id)
+            .and_then(|ticket_use| tickets.get(&ticket_use.ticket_id))
+        {
+            Some(t) => t,
+            _ => {
+                info!("Failed to find Ticket for TicketUseId {:?}", ticket_use_id);
+                continue;
+            }
+        };
+
+        let prices = get_prices(ticket_prices, &ticket.id);
+        if prices.is_empty() {
+            info!("Failed to find TicketPrice for Ticket {:?}", ticket.id);
+            continue;
+        }
+
+        for price in prices {
+            prices_v1.push(PriceV1::try_from((ticket, price))?);
+        }
+
+        fares_v1.push(FareV1 {
+            before_change: "*".to_string(),
+            after_change: format!("network=network:{}", ticket_use_perimeter.object_id),
+            start_trip: String::new(),
+            end_trip: String::new(),
+            global_condition: String::new(),
+            ticket_id: ticket.id.clone(),
+        });
+        fares_v1.push(FareV1 {
+            before_change: format!("network=network:{}", ticket_use_perimeter.object_id),
+            after_change: format!("network=network:{}", ticket_use_perimeter.object_id),
+            start_trip: String::new(),
+            end_trip: String::new(),
+            global_condition: String::new(),
+            ticket_id: ticket.id.clone(),
+        });
+    }
+
+    return write_fares_v1(
+        base_path,
+        &Collection::new(prices_v1),
+        &Collection::new(vec![]),
+        &Collection::new(fares_v1),
+    );
+}
+
+pub fn write_fares_v1_dispatch(base_path: &path::Path, collections: &Collections) -> Result<()> {
+    if has_fares_v2(collections) {
+        return write_fares_v1_from_v2(
+            base_path,
+            &collections.tickets,
+            &collections.ticket_uses,
+            &collections.ticket_prices,
+            &collections.ticket_use_perimeters,
+            &collections.ticket_use_restrictions,
+        );
+    } else if has_fares_v1(collections) {
+        return write_fares_v1(
+            base_path,
+            &collections.prices_v1,
+            &collections.od_fares_v1,
+            &collections.fares_v1,
+        );
+    }
     Ok(())
 }
 
