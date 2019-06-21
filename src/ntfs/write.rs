@@ -17,12 +17,14 @@
 use super::{Code, CommentLink, ObjectProperty, Result, Stop, StopTime};
 use crate::collection::{Collection, CollectionWithId, Id, Idx};
 use crate::model::Collections;
+use crate::ntfs::{has_fares_v1, has_fares_v2};
 use crate::objects::*;
 use crate::NTFS_VERSION;
-use chrono::NaiveDateTime;
+use chrono::{Duration, NaiveDateTime};
 use csv;
 use failure::ResultExt;
 use log::info;
+use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde;
 use std::collections::{BTreeMap, HashMap};
 use std::path;
@@ -115,16 +117,12 @@ pub fn write_vehicle_journeys_and_stop_times(
     Ok(())
 }
 
-pub fn write_fares_v1(
+fn write_fares_v1(
     base_path: &path::Path,
     prices_v1: &Collection<PriceV1>,
     od_fares_v1: &Collection<ODFareV1>,
     fares_v1: &Collection<FareV1>,
 ) -> Result<()> {
-    if prices_v1.is_empty() || od_fares_v1.is_empty() {
-        return Ok(());
-    }
-
     let file_prices = "prices.csv";
     let file_od_fares = "od_fares.csv";
     let file_fares = "fares.csv";
@@ -176,6 +174,229 @@ pub fn write_fares_v1(
     }
     fares_wtr.flush().with_context(ctx_from_path!(path))?;
 
+    Ok(())
+}
+
+fn write_fares_v1_from_v2(
+    base_path: &path::Path,
+    tickets: &CollectionWithId<Ticket>,
+    ticket_uses: &CollectionWithId<TicketUse>,
+    ticket_prices: &Collection<TicketPrice>,
+    ticket_use_perimeters: &Collection<TicketUsePerimeter>,
+    ticket_use_restrictions: &Collection<TicketUseRestriction>,
+) -> Result<()> {
+    fn has_no_transfer(ticket_uses: &CollectionWithId<TicketUse>, ticket_use_id: &String) -> bool {
+        if let Some(ticket_use) = ticket_uses.get(ticket_use_id) {
+            if (ticket_use.max_transfers.is_none() || ticket_use.max_transfers == Some(0))
+                && ticket_use.boarding_time_limit.is_none()
+                && ticket_use.alighting_time_limit.is_none()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    let mut prices_v1: Vec<PriceV1> = vec![];
+    let mut fares_v1: Vec<FareV1> = vec![];
+
+    // Conversion of OD fares on specific lines
+
+    for ticket_use_restriction in ticket_use_restrictions
+        .values()
+        .filter(|r| r.restriction_type == RestrictionType::OriginDestination)
+        .filter(|r| has_no_transfer(&ticket_uses, &r.ticket_use_id))
+    {
+        let ticket_use_id = &ticket_use_restriction.ticket_use_id;
+
+        let ticket = if let Some(ticket_use) = ticket_uses.get(ticket_use_id) {
+            if let Some(ticket) = tickets.get(&ticket_use.ticket_id) {
+                ticket
+            } else {
+                info!("Failed to find Ticket {:?}", ticket_use.ticket_id);
+                continue;
+            }
+        } else {
+            info!("Failed to find TicketUse {:?}", ticket_use_id);
+            continue;
+        };
+
+        let perimeters: Vec<_> = ticket_use_perimeters
+            .into_iter()
+            .filter(|(_, ticket_use_perimeter)| {
+                &ticket_use_perimeter.ticket_use_id == ticket_use_id
+                    && ticket_use_perimeter.object_type == ObjectType::Line
+                    && ticket_use_perimeter.perimeter_action == PerimeterAction::Included
+            })
+            .map(|(_, p)| p)
+            .collect();
+
+        if perimeters.is_empty() {
+            info!(
+                "Failed to find TicketUsePerimeter for TicketUse {:?}",
+                ticket_use_id
+            );
+            continue;
+        }
+
+        let prices: Vec<_> = ticket_prices
+            .into_iter()
+            .filter(|(_, ticket_price)| {
+                &ticket_price.ticket_id == &ticket.id && ticket_price.currency == "EUR".to_string()
+            })
+            .map(|(_, p)| p)
+            .collect();
+
+        if prices.is_empty() {
+            info!("Failed to find TicketPrice for Ticket {:?}", ticket.id);
+            continue;
+        }
+
+        for price in prices {
+            let cents_price = if let Some(cents_price) =
+                (price.price * Decimal::from(100)).round_dp(0).to_u32()
+            {
+                cents_price
+            } else {
+                0
+            };
+
+            let comment = if let Some(comment) = &ticket.comment {
+                comment.to_string()
+            } else {
+                "".to_string()
+            };
+
+            prices_v1.push(PriceV1 {
+                id: ticket.id.to_string(),
+                start_date: price.ticket_validity_start,
+                end_date: price.ticket_validity_end + Duration::days(1),
+                price: cents_price,
+                name: ticket.name.to_string(),
+                ignored: "".to_string(),
+                comment: comment,
+                currency_type: Some("centime".to_string()),
+            });
+        }
+
+        for perimeter in perimeters {
+            fares_v1.push(FareV1 {
+                before_change: "*".to_string(),
+                after_change: format!("line=line:{}", perimeter.object_id),
+                start_trip: format!("stoparea=stop_area:{}", ticket_use_restriction.use_origin),
+                end_trip: format!(
+                    "stoparea=stop_area:{}",
+                    ticket_use_restriction.use_destination
+                ),
+                global_condition: "".to_string(),
+                ticket_id: ticket.id.to_string(),
+            });
+        }
+    }
+
+    // Conversion of a flat fate on a specific network
+
+    for ticket_use_perimeter in ticket_use_perimeters.values().filter(|p| {
+        p.object_type == ObjectType::Network && p.perimeter_action == PerimeterAction::Included
+    }) {
+        let ticket_use_id = &ticket_use_perimeter.ticket_use_id;
+
+        let ticket = if let Some(ticket_use) = ticket_uses.get(ticket_use_id) {
+            if let Some(ticket) = tickets.get(&ticket_use.ticket_id) {
+                ticket
+            } else {
+                info!("Failed to find Ticket {:?}", ticket_use.ticket_id);
+                continue;
+            }
+        } else {
+            info!("Failed to find TicketUse {:?}", ticket_use_id);
+            continue;
+        };
+
+        let prices: Vec<_> = ticket_prices
+            .into_iter()
+            .filter(|(_, ticket_price)| {
+                &ticket_price.ticket_id == &ticket.id && ticket_price.currency == "EUR".to_string()
+            })
+            .map(|(_, p)| p)
+            .collect();
+
+        if prices.is_empty() {
+            info!("Failed to find TicketPrice for Ticket {:?}", ticket.id);
+            continue;
+        }
+
+        for price in prices {
+            let cents_price = if let Some(cents_price) =
+                (price.price * Decimal::from(100)).round_dp(0).to_u32()
+            {
+                cents_price
+            } else {
+                0
+            };
+
+            let comment = if let Some(comment) = &ticket.comment {
+                comment.to_string()
+            } else {
+                "".to_string()
+            };
+
+            prices_v1.push(PriceV1 {
+                id: ticket.id.to_string(),
+                start_date: price.ticket_validity_start,
+                end_date: price.ticket_validity_end + Duration::days(1),
+                price: cents_price,
+                name: ticket.name.to_string(),
+                ignored: "".to_string(),
+                comment: comment,
+                currency_type: Some("centime".to_string()),
+            });
+        }
+
+        fares_v1.push(FareV1 {
+            before_change: "*".to_string(),
+            after_change: format!("network=network:{}", ticket_use_perimeter.object_id),
+            start_trip: "".to_string(),
+            end_trip: "".to_string(),
+            global_condition: "".to_string(),
+            ticket_id: ticket.id.to_string(),
+        });
+        fares_v1.push(FareV1 {
+            before_change: format!("network=network:{}", ticket_use_perimeter.object_id),
+            after_change: format!("network=network:{}", ticket_use_perimeter.object_id),
+            start_trip: "".to_string(),
+            end_trip: "".to_string(),
+            global_condition: "".to_string(),
+            ticket_id: ticket.id.to_string(),
+        });
+    }
+
+    return write_fares_v1(
+        base_path,
+        &Collection::new(prices_v1),
+        &Collection::new(vec![]),
+        &Collection::new(fares_v1),
+    );
+}
+
+pub fn write_fares_v1_dispatch(base_path: &path::Path, collections: &Collections) -> Result<()> {
+    if has_fares_v2(collections) {
+        return write_fares_v1_from_v2(
+            base_path,
+            &collections.tickets,
+            &collections.ticket_uses,
+            &collections.ticket_prices,
+            &collections.ticket_use_perimeters,
+            &collections.ticket_use_restrictions,
+        );
+    } else if has_fares_v1(collections) {
+        return write_fares_v1(
+            base_path,
+            &collections.prices_v1,
+            &collections.od_fares_v1,
+            &collections.fares_v1,
+        );
+    }
     Ok(())
 }
 
