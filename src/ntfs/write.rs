@@ -22,7 +22,7 @@ use crate::objects::*;
 use crate::NTFS_VERSION;
 use chrono::{Duration, NaiveDateTime};
 use csv;
-use failure::ResultExt;
+use failure::{format_err, ResultExt};
 use log::info;
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde;
@@ -185,16 +185,10 @@ fn write_fares_v1_from_v2(
     ticket_use_perimeters: &Collection<TicketUsePerimeter>,
     ticket_use_restrictions: &Collection<TicketUseRestriction>,
 ) -> Result<()> {
-    fn has_no_transfer(ticket_uses: &CollectionWithId<TicketUse>, ticket_use_id: &String) -> bool {
-        if let Some(ticket_use) = ticket_uses.get(ticket_use_id) {
-            if (ticket_use.max_transfers.is_none() || ticket_use.max_transfers == Some(0))
-                && ticket_use.boarding_time_limit.is_none()
-                && ticket_use.alighting_time_limit.is_none()
-            {
-                return true;
-            }
-        }
-        false
+    fn has_constraints(ticket_use: &TicketUse) -> bool {
+        ticket_use.max_transfers.map(|mt| mt != 0).unwrap_or(false)
+            || ticket_use.boarding_time_limit.is_some()
+            || ticket_use.alighting_time_limit.is_some()
     }
 
     let mut prices_v1: Vec<PriceV1> = vec![];
@@ -204,8 +198,15 @@ fn write_fares_v1_from_v2(
 
     for ticket_use_restriction in ticket_use_restrictions
         .values()
-        .filter(|r| r.restriction_type == RestrictionType::OriginDestination)
-        .filter(|r| has_no_transfer(&ticket_uses, &r.ticket_use_id))
+        .filter(|ticket_use_restriction| {
+            ticket_use_restriction.restriction_type == RestrictionType::OriginDestination
+        })
+        .filter(|ticket_use_restriction| {
+            ticket_uses
+                .get(&ticket_use_restriction.ticket_use_id)
+                .map(|ticket_use| !has_constraints(ticket_use))
+                .unwrap_or(false)
+        })
     {
         let ticket_use_id = &ticket_use_restriction.ticket_use_id;
 
@@ -223,12 +224,12 @@ fn write_fares_v1_from_v2(
 
         let perimeters: Vec<_> = ticket_use_perimeters
             .into_iter()
-            .filter(|(_, ticket_use_perimeter)| {
-                &ticket_use_perimeter.ticket_use_id == ticket_use_id
-                    && ticket_use_perimeter.object_type == ObjectType::Line
-                    && ticket_use_perimeter.perimeter_action == PerimeterAction::Included
+            .map(|(_, ticket_use_perimeter)| ticket_use_perimeter)
+            .filter(|ticket_use_perimeter| &ticket_use_perimeter.ticket_use_id == ticket_use_id)
+            .filter(|ticket_use_perimeter| ticket_use_perimeter.object_type == ObjectType::Line)
+            .filter(|ticket_use_perimeter| {
+                ticket_use_perimeter.perimeter_action == PerimeterAction::Included
             })
-            .map(|(_, p)| p)
             .collect();
 
         if perimeters.is_empty() {
@@ -241,10 +242,9 @@ fn write_fares_v1_from_v2(
 
         let prices: Vec<_> = ticket_prices
             .into_iter()
-            .filter(|(_, ticket_price)| {
-                &ticket_price.ticket_id == &ticket.id && ticket_price.currency == "EUR".to_string()
-            })
-            .map(|(_, p)| p)
+            .map(|(_, ticket_price)| ticket_price)
+            .filter(|ticket_price| &ticket_price.ticket_id == &ticket.id)
+            .filter(|ticket_price| &ticket_price.currency == "EUR")
             .collect();
 
         if prices.is_empty() {
@@ -253,28 +253,22 @@ fn write_fares_v1_from_v2(
         }
 
         for price in prices {
-            let cents_price = if let Some(cents_price) =
-                (price.price * Decimal::from(100)).round_dp(0).to_u32()
-            {
-                cents_price
-            } else {
-                0
-            };
+            let cents_price = price.price * Decimal::from(100);
+            let cents_price = cents_price
+                .round_dp(0)
+                .to_u32()
+                .ok_or_else(|| format_err!("Cannot convert price into a u32"))?;
 
-            let comment = if let Some(comment) = &ticket.comment {
-                comment.to_string()
-            } else {
-                "".to_string()
-            };
+            let comment = ticket.comment.as_ref().cloned().unwrap_or_else(String::new);
 
             prices_v1.push(PriceV1 {
-                id: ticket.id.to_string(),
+                id: ticket.id.clone(),
                 start_date: price.ticket_validity_start,
                 end_date: price.ticket_validity_end + Duration::days(1),
                 price: cents_price,
-                name: ticket.name.to_string(),
-                ignored: "".to_string(),
-                comment: comment,
+                name: ticket.name.clone(),
+                ignored: String::new(),
+                comment,
                 currency_type: Some("centime".to_string()),
             });
         }
@@ -289,7 +283,7 @@ fn write_fares_v1_from_v2(
                     ticket_use_restriction.use_destination
                 ),
                 global_condition: "".to_string(),
-                ticket_id: ticket.id.to_string(),
+                ticket_id: ticket.id.clone(),
             });
         }
     }
