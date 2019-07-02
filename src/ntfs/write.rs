@@ -212,52 +212,58 @@ fn write_fares_v1(
     Ok(())
 }
 
-fn write_fares_v1_from_v2(
-    base_path: &path::Path,
-    tickets: &CollectionWithId<Ticket>,
-    ticket_uses: &CollectionWithId<TicketUse>,
-    ticket_prices: &Collection<TicketPrice>,
-    ticket_use_perimeters: &Collection<TicketUsePerimeter>,
-    ticket_use_restrictions: &Collection<TicketUseRestriction>,
+struct Fares<'a> {
+    tickets: &'a CollectionWithId<Ticket>,
+    ticket_prices: &'a Collection<TicketPrice>,
+    ticket_uses: &'a CollectionWithId<TicketUse>,
+    ticket_use_perimeters: &'a Collection<TicketUsePerimeter>,
+    ticket_use_restrictions: &'a Collection<TicketUseRestriction>,
+}
+
+fn has_constraints(ticket_use: &TicketUse) -> bool {
+    ticket_use.max_transfers.map(|mt| mt != 0).unwrap_or(false)
+        || ticket_use.boarding_time_limit.is_some()
+        || ticket_use.alighting_time_limit.is_some()
+}
+
+fn get_prices<'a>(
+    ticket_prices: &'a Collection<TicketPrice>,
+    ticket_id: &'a String,
+) -> Vec<&'a TicketPrice> {
+    ticket_prices
+        .values()
+        .filter(|ticket_price| &ticket_price.ticket_id == ticket_id)
+        .filter(|ticket_price| &ticket_price.currency == "EUR")
+        .collect()
+}
+
+// Conversion of OD fares on specific lines
+// https://github.com/CanalTP/transit_model/blob/master/src/documentation/ntfs_fare_conversion_v2_to_V1.md#conversion-of-an-od-fare-on-a-specific-line
+fn insert_od_specific_line_as_fare_v1(
+    fares: &Fares,
+    prices_v1: &mut Vec<PriceV1>,
+    fares_v1: &mut Vec<FareV1>,
 ) -> Result<()> {
-    fn has_constraints(ticket_use: &TicketUse) -> bool {
-        ticket_use.max_transfers.map(|mt| mt != 0).unwrap_or(false)
-            || ticket_use.boarding_time_limit.is_some()
-            || ticket_use.alighting_time_limit.is_some()
-    }
-    fn get_prices<'a>(
-        ticket_prices: &'a Collection<TicketPrice>,
-        ticket_id: &'a String,
-    ) -> Vec<&'a TicketPrice> {
-        ticket_prices
-            .into_iter()
-            .map(|(_, ticket_price)| ticket_price)
-            .filter(|ticket_price| &ticket_price.ticket_id == ticket_id)
-            .filter(|ticket_price| &ticket_price.currency == "EUR")
-            .collect()
-    }
-
-    let mut prices_v1: Vec<PriceV1> = vec![];
-    let mut fares_v1: Vec<FareV1> = vec![];
-
-    // Conversion of OD fares on specific lines
-
-    for ticket_use_restriction in ticket_use_restrictions
+    let ticket_use_restrictions = fares
+        .ticket_use_restrictions
         .values()
         .filter(|ticket_use_restriction| {
             ticket_use_restriction.restriction_type == RestrictionType::OriginDestination
         })
         .filter(|ticket_use_restriction| {
-            ticket_uses
+            fares
+                .ticket_uses
                 .get(&ticket_use_restriction.ticket_use_id)
                 .map(|ticket_use| !has_constraints(ticket_use))
                 .unwrap_or(false)
-        })
-    {
+        });
+
+    for ticket_use_restriction in ticket_use_restrictions {
         let ticket_use_id = &ticket_use_restriction.ticket_use_id;
-        let ticket = match ticket_uses
+        let ticket = match fares
+            .ticket_uses
             .get(ticket_use_id)
-            .and_then(|ticket_use| tickets.get(&ticket_use.ticket_id))
+            .and_then(|ticket_use| fares.tickets.get(&ticket_use.ticket_id))
         {
             Some(t) => t,
             _ => {
@@ -266,9 +272,9 @@ fn write_fares_v1_from_v2(
             }
         };
 
-        let perimeters: Vec<&TicketUsePerimeter> = ticket_use_perimeters
-            .into_iter()
-            .map(|(_, ticket_use_perimeter)| ticket_use_perimeter)
+        let perimeters: Vec<&TicketUsePerimeter> = fares
+            .ticket_use_perimeters
+            .values()
             .filter(|ticket_use_perimeter| &ticket_use_perimeter.ticket_use_id == ticket_use_id)
             .filter(|ticket_use_perimeter| ticket_use_perimeter.object_type == ObjectType::Line)
             .filter(|ticket_use_perimeter| {
@@ -284,7 +290,7 @@ fn write_fares_v1_from_v2(
             continue;
         }
 
-        let prices = get_prices(ticket_prices, &ticket.id);
+        let prices = get_prices(fares.ticket_prices, &ticket.id);
         if prices.is_empty() {
             info!("Failed to find TicketPrice for Ticket {:?}", ticket.id);
             continue;
@@ -308,18 +314,27 @@ fn write_fares_v1_from_v2(
             });
         }
     }
+    Ok(())
+}
 
-    // Conversion of a flat fate on a specific network
-
-    for ticket_use_perimeter in ticket_use_perimeters
+// Conversion of a flat fate on a specific network
+// https://github.com/CanalTP/transit_model/blob/master/src/documentation/ntfs_fare_conversion_v2_to_V1.md#conversion-of-a-flat-fate-on-a-specific-network
+fn insert_flat_fare_as_fare_v1(
+    fares: &Fares,
+    prices_v1: &mut Vec<PriceV1>,
+    fares_v1: &mut Vec<FareV1>,
+) -> Result<()> {
+    let ticket_use_perimeters = fares
+        .ticket_use_perimeters
         .values()
         .filter(|p| p.object_type == ObjectType::Network)
-        .filter(|p| p.perimeter_action == PerimeterAction::Included)
-    {
+        .filter(|p| p.perimeter_action == PerimeterAction::Included);
+    for ticket_use_perimeter in ticket_use_perimeters {
         let ticket_use_id = &ticket_use_perimeter.ticket_use_id;
-        let ticket = match ticket_uses
+        let ticket = match fares
+            .ticket_uses
             .get(ticket_use_id)
-            .and_then(|ticket_use| tickets.get(&ticket_use.ticket_id))
+            .and_then(|ticket_use| fares.tickets.get(&ticket_use.ticket_id))
         {
             Some(t) => t,
             _ => {
@@ -328,7 +343,7 @@ fn write_fares_v1_from_v2(
             }
         };
 
-        let prices = get_prices(ticket_prices, &ticket.id);
+        let prices = get_prices(fares.ticket_prices, &ticket.id);
         if prices.is_empty() {
             info!("Failed to find TicketPrice for Ticket {:?}", ticket.id);
             continue;
@@ -355,6 +370,15 @@ fn write_fares_v1_from_v2(
             ticket_id: ticket.id.clone(),
         });
     }
+    Ok(())
+}
+
+fn write_fares_v1_from_v2(base_path: &path::Path, fares: &Fares) -> Result<()> {
+    let mut prices_v1: Vec<PriceV1> = vec![];
+    let mut fares_v1: Vec<FareV1> = vec![];
+
+    insert_od_specific_line_as_fare_v1(fares, &mut prices_v1, &mut fares_v1)?;
+    insert_flat_fare_as_fare_v1(fares, &mut prices_v1, &mut fares_v1)?;
 
     return write_fares_v1(
         base_path,
@@ -368,11 +392,13 @@ pub fn write_fares_v1_dispatch(base_path: &path::Path, collections: &Collections
     if has_fares_v2(collections) {
         return write_fares_v1_from_v2(
             base_path,
-            &collections.tickets,
-            &collections.ticket_uses,
-            &collections.ticket_prices,
-            &collections.ticket_use_perimeters,
-            &collections.ticket_use_restrictions,
+            &Fares {
+                tickets: &collections.tickets,
+                ticket_prices: &collections.ticket_prices,
+                ticket_uses: &collections.ticket_uses,
+                ticket_use_perimeters: &collections.ticket_use_perimeters,
+                ticket_use_restrictions: &collections.ticket_use_restrictions,
+            },
         );
     } else if has_fares_v1(collections) {
         return write_fares_v1(
@@ -704,4 +730,54 @@ pub fn write_object_properties(path: &path::Path, collections: &Collections) -> 
     wtr.flush().with_context(ctx_from_path!(path))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod has_constraints {
+        use super::*;
+        use std::default::Default;
+        use pretty_assertions::assert_eq;
+
+        impl Default for TicketUse {
+            fn default() -> Self {
+                TicketUse {
+                    id: String::from("ticket_use_id"),
+                    ticket_id: String::from("ticket_id"),
+                    max_transfers: None,
+                    boarding_time_limit: None,
+                    alighting_time_limit: None,
+                }
+            }
+        }
+
+        #[test]
+        fn no_constraints() {
+            let ticket_use = TicketUse::default();
+            assert_eq!(has_constraints(&ticket_use), false);
+        }
+
+        #[test]
+        fn no_constraints_with_zero_transfers() {
+            let mut ticket_use = TicketUse::default();
+            ticket_use.max_transfers = Some(0);
+            assert_eq!(has_constraints(&ticket_use), false);
+        }
+
+        #[test]
+        fn transfer_constraint() {
+            let mut ticket_use = TicketUse::default();
+            ticket_use.max_transfers = Some(1);
+            assert_eq!(has_constraints(&ticket_use), true);
+        }
+
+        #[test]
+        fn boarding_constraint() {
+            let mut ticket_use = TicketUse::default();
+            ticket_use.boarding_time_limit = Some(666);
+            assert_eq!(has_constraints(&ticket_use), true);
+        }
+    }
 }
