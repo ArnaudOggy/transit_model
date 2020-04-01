@@ -27,7 +27,55 @@ use minidom::Element;
 use proj::Proj;
 use skip_error::skip_error_and_log;
 use std::{collections::HashMap, fs::File, io::Read};
-use typed_index_collection::CollectionWithId;
+use typed_index_collection::{impl_id, CollectionWithId};
+
+type Stops = (
+    CollectionWithId<StopArea>,
+    CollectionWithId<StopPoint>,
+    CollectionWithId<Equipment>,
+    CollectionWithId<MonomodalStopArea>,
+);
+
+#[derive(Clone, Debug, Default)]
+pub struct MonomodalStopArea {
+    pub id: String,
+    pub name: String,
+    pub coord: Coord,
+    pub visible: bool,
+    pub multimodal_stoparea_id: Option<String>,
+}
+impl_id!(MonomodalStopArea);
+
+impl From<StopArea> for MonomodalStopArea {
+    fn from(stop_area: StopArea) -> Self {
+        MonomodalStopArea {
+            id: stop_area.id,
+            name: stop_area.name,
+            coord: stop_area.coord,
+            visible: stop_area.visible,
+            multimodal_stoparea_id: None,
+        }
+    }
+}
+
+impl From<MonomodalStopArea> for StopPoint {
+    fn from(monomodal_stoparea: MonomodalStopArea) -> StopPoint {
+        let stop_area_id: String = if let Some(sa_id) = monomodal_stoparea.multimodal_stoparea_id {
+            sa_id
+        } else {
+            monomodal_stoparea.id.clone()
+        };
+        StopPoint {
+            id: monomodal_stoparea.id,
+            name: monomodal_stoparea.name,
+            visible: monomodal_stoparea.visible,
+            coord: monomodal_stoparea.coord,
+            stop_area_id,
+            stop_type: StopType::Point,
+            ..Default::default()
+        }
+    }
+}
 
 pub fn extract_quay_id(raw_id: &str) -> Result<&str> {
     raw_id
@@ -97,29 +145,40 @@ fn load_stop_areas<'a>(
     stop_places: Vec<&'a Element>,
     map_stopplace_stoparea: &mut HashMap<String, String>,
     proj: &Proj,
-) -> Result<CollectionWithId<StopArea>> {
+) -> Result<(
+    CollectionWithId<StopArea>,
+    CollectionWithId<MonomodalStopArea>,
+)> {
     let mut stop_areas = CollectionWithId::default();
+    let mut monomodal_stopareas = CollectionWithId::default();
 
     let has_parent_site_ref = |sp: &Element| sp.try_only_child("ParentSiteRef").is_ok();
 
     for stop_place in stop_places.iter().filter(|sp| !has_parent_site_ref(sp)) {
-        stop_areas.push(load_stop_area(stop_place, proj)?)?;
+        let loaded_stop_area = load_stop_area(stop_place, proj)?;
+        if loaded_stop_area.id.contains("monomodalStopPlace:") {
+            monomodal_stopareas.push(MonomodalStopArea::from(loaded_stop_area.clone()))?;
+        }
+        stop_areas.push(loaded_stop_area)?;
     }
 
     for stop_place in stop_places.iter().filter(|sp| has_parent_site_ref(sp)) {
         let parent_site_ref: String = stop_place
             .try_only_child("ParentSiteRef")?
             .try_attribute_with("ref", extract_multimodal_stop_place_id)?;
-
         let stop_place_id = stop_place.try_attribute_with("id", extract_monomodal_stop_place_id)?;
+        let loaded_stop_area = load_stop_area(stop_place, proj)?;
+        let mut monomodal_stoparea = MonomodalStopArea::from(loaded_stop_area.clone());
         if stop_areas.get(&parent_site_ref).is_some() {
-            map_stopplace_stoparea.insert(stop_place_id, parent_site_ref.clone());
+            monomodal_stoparea.multimodal_stoparea_id = Some(parent_site_ref.clone());
+            map_stopplace_stoparea.insert(stop_place_id, parent_site_ref);
         } else {
-            stop_areas.push(load_stop_area(stop_place, proj)?)?;
+            stop_areas.push(loaded_stop_area)?;
             map_stopplace_stoparea.insert(stop_place_id.clone(), stop_place_id);
         }
+        monomodal_stopareas.push(monomodal_stoparea)?;
     }
-    Ok(stop_areas)
+    Ok((stop_areas, monomodal_stopareas))
 }
 
 fn load_coords(elem: &Element) -> Result<(f64, f64)> {
@@ -275,13 +334,7 @@ fn load_stop_points<'a>(
     Ok((stop_points, CollectionWithId::new(equipments)?))
 }
 
-fn load_stops(
-    frames: &Frames,
-) -> Result<(
-    CollectionWithId<StopArea>,
-    CollectionWithId<StopPoint>,
-    CollectionWithId<Equipment>,
-)> {
+fn load_stops(frames: &Frames) -> Result<Stops> {
     let member_children = || {
         frames
             .get(&FrameType::General)
@@ -298,8 +351,7 @@ fn load_stops(
         .ok_or_else(|| format_err!("Proj cannot build a converter from '{}' to '{}'", from, to))?;
 
     let mut map_stopplace_stoparea = HashMap::default();
-
-    let mut stop_areas = load_stop_areas(
+    let (mut stop_areas, monomodal_stopareas) = load_stop_areas(
         member_children()
             .filter(|e| e.name() == "StopPlace")
             .collect(),
@@ -314,10 +366,13 @@ fn load_stops(
         &proj,
     )?;
 
-    Ok((stop_areas, stop_points, equipments))
+    Ok((stop_areas, stop_points, equipments, monomodal_stopareas))
 }
 
-pub fn from_path(path: &std::path::Path, collections: &mut Collections) -> Result<()> {
+pub fn from_path(
+    path: &std::path::Path,
+    collections: &mut Collections,
+) -> Result<CollectionWithId<MonomodalStopArea>> {
     info!("Reading {:?}", path);
 
     let mut file = File::open(&path).with_context(|_| format!("Error reading {:?}", path))?;
@@ -332,13 +387,13 @@ pub fn from_path(path: &std::path::Path, collections: &mut Collections) -> Resul
             .try_only_child("frames")?,
     )?;
 
-    let (stop_areas, stop_points, equipments) = load_stops(&frames)?;
+    let (stop_areas, stop_points, equipments, monomodal_stopareas) = load_stops(&frames)?;
 
     collections.stop_areas.try_merge(stop_areas)?;
     collections.stop_points.try_merge(stop_points)?;
     collections.equipments.try_merge(equipments)?;
 
-    Ok(())
+    Ok(monomodal_stopareas)
 }
 
 #[cfg(test)]

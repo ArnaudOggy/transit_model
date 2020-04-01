@@ -18,7 +18,7 @@ use super::{
     common, lines,
     lines::LineNetexIDF,
     modes::MODES,
-    stops,
+    stops::{self, MonomodalStopArea},
 };
 use crate::{
     minidom_utils::{TryAttribute, TryOnlyChild},
@@ -59,6 +59,7 @@ pub enum GeneralFrameType {
     Common,
 }
 type GeneralFrames<'a> = HashMap<GeneralFrameType, &'a Element>;
+type VehicleJourneyStopAssignment = HashMap<(String, String), Idx<StopPoint>>;
 
 impl std::fmt::Display for GeneralFrameType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -76,8 +77,10 @@ struct DestinationDisplay {
     public_code: Option<String>,
 }
 type DestinationDisplays = HashMap<String, DestinationDisplay>;
+#[derive(Debug, Clone)]
 struct StopPointInJourneyPattern {
     stop_point_idx: Idx<StopPoint>,
+    scheduled_stop_point_ref: String,
     pickup_type: u8,
     drop_off_type: u8,
     local_zone_id: Option<u16>,
@@ -189,6 +192,7 @@ pub fn read_offer_folder(
     offer_folder: &Path,
     collections: &mut Collections,
     lines_netex_idf: &CollectionWithId<LineNetexIDF>,
+    monomodal_stopareas: &CollectionWithId<MonomodalStopArea>,
 ) -> Result<()> {
     let calendars_path = offer_folder.join(CALENDARS_FILENAME);
     let (map_daytypes, validity_period) = if calendars_path.exists() {
@@ -249,8 +253,14 @@ pub fn read_offer_folder(
             .map_err(|_| format_err!("Failed to open {}", offer_path.display()))?;
         info!("Reading {}", offer_path.display());
         let (routes, vehicle_journeys, calendars) = skip_error_and_log!(
-            parse_offer(&offer, collections, lines_netex_idf, &map_daytypes)
-                .map_err(|e| format_err!("Skip file {}: {}", offer_path.display(), e)),
+            parse_offer(
+                &offer,
+                collections,
+                lines_netex_idf,
+                &map_daytypes,
+                monomodal_stopareas
+            )
+            .map_err(|e| format_err!("Skip file {}: {}", offer_path.display(), e)),
             LogLevel::Warn
         );
         collections.routes.try_merge(routes)?;
@@ -320,10 +330,14 @@ where
             map_schedule_stop_point_quay,
         )
         .map_err(|err| format_err!("impossible to get the stop point: {}", err))?;
+        let scheduled_stop_point_ref: String = stop_point_in_journey_pattern_element
+            .try_only_child("ScheduledStopPointRef")
+            .and_then(|ssp_ref_el| ssp_ref_el.try_attribute::<String>("ref"))?;
         let pickup_type = boarding_type(stop_point_in_journey_pattern_element, "ForBoarding");
         let drop_off_type = boarding_type(stop_point_in_journey_pattern_element, "ForAlighting");
         Ok(StopPointInJourneyPattern {
             stop_point_idx,
+            scheduled_stop_point_ref,
             pickup_type,
             drop_off_type,
             local_zone_id: None,
@@ -432,19 +446,93 @@ where
         .collect()
 }
 
-fn parse_passenger_stop_assignment<'a, I>(psa_elements: I) -> HashMap<String, String>
+pub fn get_or_create_stop_point(
+    stop_place_ref: &str,
+    stop_points: &mut CollectionWithId<StopPoint>,
+    monomodal_stopareas: &CollectionWithId<MonomodalStopArea>,
+) -> Result<Idx<StopPoint>> {
+    let stop_place_id = stops::extract_monomodal_stop_place_id(stop_place_ref)?;
+    let stop_point_idx = if let Some(sp_idx) = stop_points.get_idx(&stop_place_id) {
+        sp_idx
+    } else {
+        let monomodal_stoparea = monomodal_stopareas
+            .get(&stop_place_id)
+            .ok_or_else(|| format_err!("Failed to find StopPlace {}", stop_place_ref))?;
+        stop_points.push(StopPoint::from(monomodal_stoparea.to_owned()))?
+    };
+    Ok(stop_point_idx)
+}
+
+fn parse_passenger_stop_assignment<'a, I>(
+    psa_elements: I,
+    stop_points: &mut CollectionWithId<StopPoint>,
+    monomodal_stopareas: &CollectionWithId<MonomodalStopArea>,
+) -> HashMap<String, String>
 where
     I: Iterator<Item = &'a Element>,
 {
     psa_elements
         .filter_map(|psa_element| {
+            let psa_id: String = psa_element.attribute("id")?;
             let scheduled_stop_point_ref: String = psa_element
                 .only_child("ScheduledStopPointRef")?
                 .attribute("ref")?;
-            let quay_ref: String = psa_element
+            let quay_ref_opt: Option<String> = psa_element
+                .only_child("QuayRef")
+                .and_then(|quay_ref_el| quay_ref_el.attribute_with("ref", stops::extract_quay_id));
+            let stop_place_ref_opt: Option<String> = psa_element
+                .only_child("StopPlaceRef")
+                .and_then(|stop_place_ref_el| stop_place_ref_el.attribute("ref"));
+            if quay_ref_opt.is_some() {
+                Some((scheduled_stop_point_ref, quay_ref_opt?))
+            } else if stop_place_ref_opt.is_some() {
+                stop_place_ref_opt
+                    .map(|spr| get_or_create_stop_point(&spr, stop_points, monomodal_stopareas))?
+                    .map(|sp_idx| stop_points[sp_idx].id.clone())
+                    .map(|sp_id| Some((scheduled_stop_point_ref, sp_id)))
+                    .unwrap_or_default()
+            } else {
+                warn!(
+                    "Missing QuayRef or StopPlaceRef node in PassengerStopAssignment {}",
+                    psa_id
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+fn parse_vehicle_journey_stop_assignment<'a, I>(
+    vjsa_elements: I,
+    stop_points: &CollectionWithId<StopPoint>,
+) -> VehicleJourneyStopAssignment
+where
+    I: Iterator<Item = &'a Element>,
+{
+    vjsa_elements
+        .filter_map(|vjsa_element| {
+            let vjsa_id: String = vjsa_element.attribute("id")?;
+            let vehicle_journey_ref: String = vjsa_element
+                .only_child("VehicleJourneyRef")?
+                .attribute("ref")?;
+            let scheduled_stop_point_ref: String = vjsa_element
+                .only_child("ScheduledStopPointRef")?
+                .attribute("ref")?;
+            let quay_ref: String = vjsa_element
                 .only_child("QuayRef")?
                 .attribute_with("ref", stops::extract_quay_id)?;
-            Some((scheduled_stop_point_ref, quay_ref))
+            if let Some(stop_point_idx) = stop_points.get_idx(&quay_ref) {
+                Some((
+                    (vehicle_journey_ref, scheduled_stop_point_ref),
+                    stop_point_idx,
+                ))
+            } else {
+                warn!(
+                    "Failed to find Quay {} in VehicleJourneyStopAssignment {}",
+                    quay_ref, vjsa_id
+                );
+                None
+            }
         })
         .collect()
 }
@@ -588,12 +676,13 @@ fn stop_point_idx(
 fn stop_times(
     service_journey_element: &Element,
     journey_patterns: &JourneyPatterns,
+    map_vj_schedule_stop_point_quay: &VehicleJourneyStopAssignment,
 ) -> Result<Vec<StopTime>> {
+    let service_journey_id: String = service_journey_element.try_attribute("id")?;
     let timetable_passing_times = service_journey_element
         .only_child("passingTimes")
         .into_iter()
         .flat_map(|el| el.children());
-
     let journey_pattern_ref: String = service_journey_element
         .try_only_child("JourneyPatternRef")?
         .try_attribute("ref")?;
@@ -608,10 +697,20 @@ fn stop_times(
         .map(|(sequence, (tpt, stop_point_in_journey_pattern))| {
             let StopPointInJourneyPattern {
                 stop_point_idx,
+                scheduled_stop_point_ref,
                 pickup_type,
                 drop_off_type,
                 local_zone_id,
-            } = *stop_point_in_journey_pattern;
+            } = stop_point_in_journey_pattern.to_owned();
+            let stop_point_idx = if let Some(new_stop_point_idx) = map_vj_schedule_stop_point_quay
+                .get(&(service_journey_id.to_string(), scheduled_stop_point_ref))
+            {
+                // Change StopPoint (idx) from virtual StopPoint (if exist, created from monomodal stopplace)
+                // to a true StopPoint/Quay specified for this vehicle in the section VehicleJourneyStopAssignment
+                *new_stop_point_idx
+            } else {
+                stop_point_idx
+            };
             let times = arrival_departure_times(tpt)?;
             let stop_time = StopTime {
                 stop_point_idx,
@@ -640,6 +739,7 @@ fn parse_vehicle_journeys<'a, I>(
     routes: &CollectionWithId<Route>,
     journey_patterns: &JourneyPatterns,
     map_daytypes: &DayTypes,
+    map_vj_schedule_stop_point_quay: &VehicleJourneyStopAssignment,
 ) -> Result<(CollectionWithId<VehicleJourney>, CollectionWithId<Calendar>)>
 where
     I: Iterator<Item = &'a Element>,
@@ -760,7 +860,11 @@ where
         }
 
         let stop_times = skip_error_and_log!(
-            stop_times(service_journey_element, &journey_patterns),
+            stop_times(
+                service_journey_element,
+                &journey_patterns,
+                &map_vj_schedule_stop_point_quay
+            ),
             LogLevel::Warn
         );
         if stop_times.is_empty() {
@@ -805,9 +909,10 @@ where
 
 fn parse_offer(
     offer: &Element,
-    collections: &Collections,
+    collections: &mut Collections,
     lines_netex_idf: &CollectionWithId<LineNetexIDF>,
     map_daytypes: &DayTypes,
+    monomodal_stopareas: &CollectionWithId<MonomodalStopArea>,
 ) -> Result<(
     CollectionWithId<Route>,
     CollectionWithId<VehicleJourney>,
@@ -831,12 +936,29 @@ fn parse_offer(
     let schedule_frame = general_frames
         .get(&GeneralFrameType::Schedule)
         .ok_or_else(|| format_err!("Failed to find the GeneralFrame of type {}", NETEX_SCHEDULE))?;
+
     let map_schedule_stop_point_quay = structure_frame
         .only_child("members")
         .map(Element::children)
         .map(|childrens| childrens.filter(|e| e.name() == "PassengerStopAssignment"))
-        .map(parse_passenger_stop_assignment)
+        .map(|psa_elements| {
+            parse_passenger_stop_assignment(
+                psa_elements,
+                &mut collections.stop_points,
+                monomodal_stopareas,
+            )
+        })
         .unwrap_or_else(HashMap::new);
+
+    let map_vj_schedule_stop_point_quay = schedule_frame
+        .only_child("members")
+        .map(Element::children)
+        .map(|childrens| childrens.filter(|e| e.name() == "VehicleJourneyStopAssignment"))
+        .map(|vjsa_elements| {
+            parse_vehicle_journey_stop_assignment(vjsa_elements, &collections.stop_points)
+        })
+        .unwrap_or_else(HashMap::new);
+
     let routes = structure_frame
         .only_child("members")
         .map(Element::children)
@@ -890,6 +1012,7 @@ fn parse_offer(
                 &routes,
                 &journey_patterns,
                 map_daytypes,
+                &map_vj_schedule_stop_point_quay,
             )
         })
         .transpose()?
@@ -1134,6 +1257,7 @@ mod tests {
             .unwrap();
             stop_points_in_journey_pattern.push(StopPointInJourneyPattern {
                 stop_point_idx,
+                scheduled_stop_point_ref: String::new(),
                 pickup_type: 0,
                 drop_off_type: 1,
                 local_zone_id: None,
@@ -1207,6 +1331,7 @@ mod tests {
                 &CollectionWithId::default(),
                 &journey_patterns,
                 &day_types,
+                &HashMap::default(),
             )
             .unwrap();
 
@@ -1275,6 +1400,7 @@ mod tests {
                 &CollectionWithId::default(),
                 &journey_patterns,
                 &day_types,
+                &HashMap::default(),
             )
             .unwrap();
             assert_eq!(0, vehicle_journeys.len());
@@ -1296,6 +1422,7 @@ mod tests {
                 &CollectionWithId::default(),
                 &journey_patterns,
                 &day_types,
+                &HashMap::default(),
             )
             .unwrap();
             assert_eq!(0, vehicle_journeys.len());
@@ -1325,6 +1452,7 @@ mod tests {
                 &CollectionWithId::default(),
                 &journey_patterns,
                 &day_types,
+                &HashMap::default(),
             )
             .unwrap();
             assert_eq!(0, vehicle_journeys.len());
@@ -1360,6 +1488,7 @@ mod tests {
                 &CollectionWithId::default(),
                 &journey_patterns,
                 &day_types,
+                &HashMap::default(),
             )
             .unwrap();
             assert_eq!(0, vehicle_journeys.len());
@@ -1390,6 +1519,7 @@ mod tests {
                 &CollectionWithId::default(),
                 &journey_patterns,
                 &day_types,
+                &HashMap::default(),
             )
             .unwrap();
 
@@ -1663,6 +1793,7 @@ mod tests {
                 .into_iter()
                 .map(|stop_point_idx| StopPointInJourneyPattern {
                     stop_point_idx,
+                    scheduled_stop_point_ref: String::new(),
                     pickup_type: 0,
                     drop_off_type: 0,
                     local_zone_id: None,
@@ -1690,6 +1821,7 @@ mod tests {
                 .into_iter()
                 .map(|stop_point_idx| StopPointInJourneyPattern {
                     stop_point_idx,
+                    scheduled_stop_point_ref: String::new(),
                     pickup_type: 0,
                     drop_off_type: 0,
                     local_zone_id: None,
@@ -1719,6 +1851,7 @@ mod tests {
                     .into_iter()
                     .map(|stop_point_idx| StopPointInJourneyPattern {
                         stop_point_idx,
+                        scheduled_stop_point_ref: String::new(),
                         pickup_type: 0,
                         drop_off_type: 0,
                         local_zone_id: None,
@@ -1748,6 +1881,7 @@ mod tests {
                 .into_iter()
                 .map(|stop_point_idx| StopPointInJourneyPattern {
                     stop_point_idx,
+                    scheduled_stop_point_ref: String::new(),
                     pickup_type: 0,
                     drop_off_type: 0,
                     local_zone_id: None,
