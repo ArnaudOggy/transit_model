@@ -18,7 +18,7 @@ use super::{
     common, lines,
     lines::LineNetexIDF,
     modes::MODES,
-    stops::{self, MonomodalStopArea},
+    stops,
 };
 use crate::{
     minidom_utils::{TryAttribute, TryOnlyChild},
@@ -192,7 +192,7 @@ pub fn read_offer_folder(
     offer_folder: &Path,
     collections: &mut Collections,
     lines_netex_idf: &CollectionWithId<LineNetexIDF>,
-    monomodal_stopareas: &CollectionWithId<MonomodalStopArea>,
+    virtual_stop_points: &CollectionWithId<VirtualStopPoint>,
 ) -> Result<()> {
     let calendars_path = offer_folder.join(CALENDARS_FILENAME);
     let (map_daytypes, validity_period) = if calendars_path.exists() {
@@ -258,7 +258,7 @@ pub fn read_offer_folder(
                 collections,
                 lines_netex_idf,
                 &map_daytypes,
-                monomodal_stopareas
+                virtual_stop_points
             )
             .map_err(|e| format_err!("Skip file {}: {}", offer_path.display(), e)),
             LogLevel::Warn
@@ -446,19 +446,20 @@ where
         .collect()
 }
 
+type VirtualStopPoint = StopPoint;
 pub fn get_or_create_stop_point(
     stop_place_ref: &str,
     stop_points: &mut CollectionWithId<StopPoint>,
-    monomodal_stopareas: &CollectionWithId<MonomodalStopArea>,
+    virtual_stop_points: &CollectionWithId<VirtualStopPoint>,
 ) -> Result<Idx<StopPoint>> {
     let stop_place_id = stops::extract_monomodal_stop_place_id(stop_place_ref)?;
     let stop_point_idx = if let Some(sp_idx) = stop_points.get_idx(&stop_place_id) {
         sp_idx
     } else {
-        let monomodal_stoparea = monomodal_stopareas
+        let virtual_stop_point = virtual_stop_points
             .get(&stop_place_id)
             .ok_or_else(|| format_err!("Failed to find StopPlace {}", stop_place_ref))?;
-        stop_points.push(StopPoint::from(monomodal_stoparea.to_owned()))?
+        stop_points.push(virtual_stop_point.to_owned())?
     };
     Ok(stop_point_idx)
 }
@@ -466,7 +467,7 @@ pub fn get_or_create_stop_point(
 fn parse_passenger_stop_assignment<'a, I>(
     psa_elements: I,
     stop_points: &mut CollectionWithId<StopPoint>,
-    monomodal_stopareas: &CollectionWithId<MonomodalStopArea>,
+    virtual_stop_points: &CollectionWithId<VirtualStopPoint>,
 ) -> HashMap<String, String>
 where
     I: Iterator<Item = &'a Element>,
@@ -486,7 +487,7 @@ where
                 element
                     .only_child("StopPlaceRef")
                     .and_then(|stop_place_ref_el| stop_place_ref_el.attribute::<String>("ref"))
-                    .map(|spr| get_or_create_stop_point(&spr, stop_points, monomodal_stopareas))?
+                    .map(|spr| get_or_create_stop_point(&spr, stop_points, virtual_stop_points))?
                     .map(|sp_idx| stop_points[sp_idx].id.clone())
                     // We only want to WARN about the error so
                     // the `.map_err` doesn't have to return the error
@@ -719,7 +720,7 @@ fn stop_times(
             let stop_point_idx = if let Some(new_stop_point_idx) = map_vj_schedule_stop_point_quay
                 .get(&(service_journey_id.to_string(), scheduled_stop_point_ref))
             {
-                // Change StopPoint (idx) from virtual StopPoint (if exist, created from monomodal stopplace)
+                // Change StopPoint (idx) from virtual StopPoint
                 // to a true StopPoint/Quay specified for this vehicle in the section VehicleJourneyStopAssignment
                 *new_stop_point_idx
             } else {
@@ -926,7 +927,7 @@ fn parse_offer(
     collections: &mut Collections,
     lines_netex_idf: &CollectionWithId<LineNetexIDF>,
     map_daytypes: &DayTypes,
-    monomodal_stopareas: &CollectionWithId<MonomodalStopArea>,
+    virtual_stop_points: &CollectionWithId<VirtualStopPoint>,
 ) -> Result<(
     CollectionWithId<Route>,
     CollectionWithId<VehicleJourney>,
@@ -959,7 +960,7 @@ fn parse_offer(
             parse_passenger_stop_assignment(
                 psa_elements,
                 &mut collections.stop_points,
-                monomodal_stopareas,
+                virtual_stop_points,
             )
         })
         .unwrap_or_else(HashMap::new);

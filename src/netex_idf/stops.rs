@@ -27,50 +27,24 @@ use minidom::Element;
 use proj::Proj;
 use skip_error::skip_error_and_log;
 use std::{collections::HashMap, fs::File, io::Read};
-use typed_index_collection::{impl_id, CollectionWithId};
+use typed_index_collection::CollectionWithId;
 
+type VirtualStopPoint = StopPoint;
 type Stops = (
     CollectionWithId<StopArea>,
     CollectionWithId<StopPoint>,
     CollectionWithId<Equipment>,
-    CollectionWithId<MonomodalStopArea>,
+    CollectionWithId<VirtualStopPoint>,
 );
 
-#[derive(Clone, Debug, Default)]
-pub struct MonomodalStopArea {
-    pub id: String,
-    pub name: String,
-    pub coord: Coord,
-    pub visible: bool,
-    pub multimodal_stoparea_id: Option<String>,
-}
-impl_id!(MonomodalStopArea);
-
-impl From<StopArea> for MonomodalStopArea {
+impl From<StopArea> for StopPoint {
     fn from(stop_area: StopArea) -> Self {
-        MonomodalStopArea {
-            id: stop_area.id,
-            name: stop_area.name,
-            coord: stop_area.coord,
-            visible: stop_area.visible,
-            multimodal_stoparea_id: None,
-        }
-    }
-}
-
-impl From<MonomodalStopArea> for StopPoint {
-    fn from(monomodal_stoparea: MonomodalStopArea) -> StopPoint {
-        let stop_area_id: String = if let Some(sa_id) = monomodal_stoparea.multimodal_stoparea_id {
-            sa_id
-        } else {
-            monomodal_stoparea.id.clone()
-        };
         StopPoint {
-            id: monomodal_stoparea.id,
-            name: monomodal_stoparea.name,
-            visible: monomodal_stoparea.visible,
-            coord: monomodal_stoparea.coord,
-            stop_area_id,
+            id: stop_area.id.clone(),
+            name: stop_area.name,
+            visible: stop_area.visible,
+            coord: stop_area.coord,
+            stop_area_id: stop_area.id.clone(),
             stop_type: StopType::Point,
             ..Default::default()
         }
@@ -145,19 +119,16 @@ fn load_stop_areas<'a>(
     stop_places: Vec<&'a Element>,
     map_stopplace_stoparea: &mut HashMap<String, String>,
     proj: &Proj,
-) -> Result<(
-    CollectionWithId<StopArea>,
-    CollectionWithId<MonomodalStopArea>,
-)> {
+) -> Result<(CollectionWithId<StopArea>, CollectionWithId<StopPoint>)> {
     let mut stop_areas = CollectionWithId::default();
-    let mut monomodal_stopareas = CollectionWithId::default();
+    let mut virtual_stop_points = CollectionWithId::default();
 
     let has_parent_site_ref = |sp: &Element| sp.try_only_child("ParentSiteRef").is_ok();
 
     for stop_place in stop_places.iter().filter(|sp| !has_parent_site_ref(sp)) {
         let loaded_stop_area = load_stop_area(stop_place, proj)?;
         if loaded_stop_area.id.contains("monomodalStopPlace:") {
-            monomodal_stopareas.push(MonomodalStopArea::from(loaded_stop_area.clone()))?;
+            virtual_stop_points.push(StopPoint::from(loaded_stop_area.clone()))?;
         }
         stop_areas.push(loaded_stop_area)?;
     }
@@ -168,17 +139,17 @@ fn load_stop_areas<'a>(
             .try_attribute_with("ref", extract_multimodal_stop_place_id)?;
         let stop_place_id = stop_place.try_attribute_with("id", extract_monomodal_stop_place_id)?;
         let loaded_stop_area = load_stop_area(stop_place, proj)?;
-        let mut monomodal_stoparea = MonomodalStopArea::from(loaded_stop_area.clone());
+        let mut virtual_stop_point = StopPoint::from(loaded_stop_area.clone());
         if stop_areas.get(&parent_site_ref).is_some() {
-            monomodal_stoparea.multimodal_stoparea_id = Some(parent_site_ref.clone());
+            virtual_stop_point.stop_area_id = parent_site_ref.clone();
             map_stopplace_stoparea.insert(stop_place_id, parent_site_ref);
         } else {
             stop_areas.push(loaded_stop_area)?;
             map_stopplace_stoparea.insert(stop_place_id.clone(), stop_place_id);
         }
-        monomodal_stopareas.push(monomodal_stoparea)?;
+        virtual_stop_points.push(virtual_stop_point)?;
     }
-    Ok((stop_areas, monomodal_stopareas))
+    Ok((stop_areas, virtual_stop_points))
 }
 
 fn load_coords(elem: &Element) -> Result<(f64, f64)> {
@@ -372,7 +343,7 @@ fn load_stops(frames: &Frames) -> Result<Stops> {
 pub fn from_path(
     path: &std::path::Path,
     collections: &mut Collections,
-) -> Result<CollectionWithId<MonomodalStopArea>> {
+) -> Result<CollectionWithId<VirtualStopPoint>> {
     info!("Reading {:?}", path);
 
     let mut file = File::open(&path).with_context(|_| format!("Error reading {:?}", path))?;

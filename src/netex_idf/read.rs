@@ -48,7 +48,7 @@ where
     collections.feed_infos = feed_infos;
 
     let path = netex_idf_path.as_ref();
-    let monomodal_stopareas = stops::from_path(&path.join(STOPS_FILENAME), &mut collections)?;
+    let virtual_stop_points = stops::from_path(&path.join(STOPS_FILENAME), &mut collections)?;
     let lines_netex_idf = lines::from_path(&path.join(LINES_FILENAME), &mut collections)?;
     for offer_folder in WalkDir::new(path)
         .min_depth(1)
@@ -63,7 +63,7 @@ where
                 offer_folder.path(),
                 &mut collections,
                 &lines_netex_idf,
-                &monomodal_stopareas
+                &virtual_stop_points
             ),
             LogLevel::Warn
         );
