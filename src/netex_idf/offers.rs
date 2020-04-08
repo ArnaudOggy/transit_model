@@ -575,12 +575,18 @@ fn enhance_with_object_code(
     journey_patterns: &JourneyPatterns,
 ) -> CollectionWithId<Route> {
     let mut enhanced_routes = CollectionWithId::default();
-    let map_routes_journeypatterns: HashMap<&String, String> = journey_patterns
-        .iter()
-        .map(|(jp_id, journey_pattern)| (&journey_pattern.route.id, jp_id.clone()))
-        .collect();
+    let map_routes_journeypatterns: HashMap<&String, Vec<String>> =
+        journey_patterns
+            .iter()
+            .fold(HashMap::new(), |mut mrjp, (jp_id, journey_pattern)| {
+                mrjp.entry(&journey_pattern.route.id)
+                    .or_insert_with(Vec::new)
+                    .push(jp_id.clone());
+                mrjp
+            });
+
     for route in routes.values() {
-        let journey_pattern_ref = skip_error_and_log!(
+        let journey_patterns_ref = skip_error_and_log!(
             map_routes_journeypatterns.get(&route.id).ok_or_else(|| {
                 format_err!(
                     "Route {} doesn't have any ServiceJourneyPattern associated",
@@ -590,10 +596,12 @@ fn enhance_with_object_code(
             LogLevel::Warn
         );
         let mut codes = KeysValues::default();
-        codes.insert((
-            "Netex_ServiceJourneyPattern".into(),
-            journey_pattern_ref.clone(),
-        ));
+        for journey_pattern_ref in journey_patterns_ref {
+            codes.insert((
+                "Netex_ServiceJourneyPattern".into(),
+                journey_pattern_ref.clone(),
+            ));
+        }
         let mut route = route.clone();
         route.codes.extend(codes);
         // We are inserting only routes that were already in a 'CollectionWithId'
