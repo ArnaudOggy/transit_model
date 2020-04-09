@@ -477,27 +477,33 @@ where
             let scheduled_stop_point_ref: String = psa_element
                 .only_child("ScheduledStopPointRef")?
                 .attribute("ref")?;
-            let quay_ref_opt: Option<String> = psa_element
-                .only_child("QuayRef")
-                .and_then(|quay_ref_el| quay_ref_el.attribute_with("ref", stops::extract_quay_id));
-            let stop_place_ref_opt: Option<String> = psa_element
-                .only_child("StopPlaceRef")
-                .and_then(|stop_place_ref_el| stop_place_ref_el.attribute("ref"));
-            if quay_ref_opt.is_some() {
-                Some((scheduled_stop_point_ref, quay_ref_opt?))
-            } else if stop_place_ref_opt.is_some() {
-                stop_place_ref_opt
+            let get_quay_ref = |element: &Element| -> Option<String> {
+                element.only_child("QuayRef").and_then(|quay_ref_el| {
+                    quay_ref_el.attribute_with("ref", stops::extract_quay_id)
+                })
+            };
+            let mut get_stop_place_ref = |element: &Element| -> Option<String> {
+                element
+                    .only_child("StopPlaceRef")
+                    .and_then(|stop_place_ref_el| stop_place_ref_el.attribute::<String>("ref"))
                     .map(|spr| get_or_create_stop_point(&spr, stop_points, monomodal_stopareas))?
                     .map(|sp_idx| stop_points[sp_idx].id.clone())
-                    .map(|sp_id| Some((scheduled_stop_point_ref, sp_id)))
-                    .unwrap_or_default()
-            } else {
-                warn!(
-                    "Missing QuayRef or StopPlaceRef node in PassengerStopAssignment {}",
-                    psa_id
-                );
-                None
-            }
+                    // We only want to WARN about the error so
+                    // the `.map_err` doesn't have to return the error
+                    .map_err(|e| warn!("{}", e))
+                    // Error is ignored here
+                    .ok()
+            };
+            get_quay_ref(psa_element)
+                .or_else(|| get_stop_place_ref(psa_element))
+                .map(|stop_id| (scheduled_stop_point_ref, stop_id))
+                .or_else(|| {
+                    warn!(
+                        "Missing QuayRef or StopPlaceRef node in PassengerStopAssignment {}",
+                        psa_id
+                    );
+                    None
+                })
         })
         .collect()
 }
