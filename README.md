@@ -1,4 +1,4 @@
-# transit_model &emsp; ![Github Actions Status][github_actions]
+# transit_model X &emsp; ![Github Actions Status][github_actions]
 
 [github_actions]: https://github.com/CanalTP/transit_model/workflows/Continuous%20Integration/badge.svg
 
